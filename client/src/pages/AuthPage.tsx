@@ -1,3 +1,4 @@
+// client/src/pages/AuthPage.tsx
 import { useState, useEffect } from "react";
 import { useLocation } from "wouter";
 import { useAuth } from "@/hooks/use-auth";
@@ -7,19 +8,52 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Stethoscope, Shield, Users, Activity } from "lucide-react";
 
+// Toggle with env var. Defaults to TRUE for now (auth disabled).
+// Set VITE_DISABLE_AUTH=false later to turn real sign-in back on.
+const DISABLE_AUTH =
+  (import.meta.env.VITE_DISABLE_AUTH ?? "true") === "true";
+
 export default function AuthPage() {
   const [, navigate] = useLocation();
   const { user, loginMutation } = useAuth();
   const [loginForm, setLoginForm] = useState({ username: "", password: "" });
 
+  // When auth is disabled, immediately bypass the page.
   useEffect(() => {
-    if (user) {
-      navigate("/");
+    if (DISABLE_AUTH) {
+      // Minimal token/user so simple guards pass
+      try {
+        localStorage.setItem("authToken", "demo-bypass");
+        localStorage.setItem(
+          "authUser",
+          JSON.stringify({ id: "demo", username: "demo", role: "admin" })
+        );
+      } catch {}
+      // Hard redirect to reset any providers/guards
+      window.location.replace("/patients");
+      return;
     }
+    // Normal flow: if already logged in, go home
+    if (user) navigate("/");
   }, [user, navigate]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    if (DISABLE_AUTH) {
+      // Safety: if someone clicks the button before redirect fires
+      try {
+        localStorage.setItem("authToken", "demo-bypass");
+        localStorage.setItem(
+          "authUser",
+          JSON.stringify({ id: "demo", username: loginForm.username || "demo", role: "admin" })
+        );
+      } catch {}
+      window.location.replace("/patients");
+      return;
+    }
+
+    // Real login (when re-enabled)
     loginMutation.mutate(loginForm);
   };
 
@@ -43,7 +77,7 @@ export default function AuthPage() {
             <CardHeader>
               <CardTitle>Welcome Back</CardTitle>
               <CardDescription>
-                Sign in to access the clinic management system
+                {DISABLE_AUTH ? "Auth disabled — redirecting…" : "Sign in to access the clinic management system"}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -59,6 +93,7 @@ export default function AuthPage() {
                       setLoginForm({ ...loginForm, username: e.target.value })
                     }
                     required
+                    disabled={DISABLE_AUTH}
                   />
                 </div>
                 <div className="space-y-2">
@@ -72,19 +107,26 @@ export default function AuthPage() {
                       setLoginForm({ ...loginForm, password: e.target.value })
                     }
                     required
+                    disabled={DISABLE_AUTH}
                   />
                 </div>
                 <Button
                   type="submit"
                   className="w-full"
                   data-testid="button-login"
-                  disabled={loginMutation.isPending}
+                  disabled={loginMutation.isPending || DISABLE_AUTH}
                 >
-                  {loginMutation.isPending ? "Signing in..." : "Sign In"}
+                  {DISABLE_AUTH
+                    ? "Redirecting…"
+                    : loginMutation.isPending
+                    ? "Signing in..."
+                    : "Sign In"}
                 </Button>
               </form>
               <p className="text-sm text-gray-500 dark:text-gray-400 mt-4 text-center">
-                Contact your administrator to create an account
+                {DISABLE_AUTH
+                  ? "Demo mode is active."
+                  : "Contact your administrator to create an account"}
               </p>
             </CardContent>
           </Card>
