@@ -1,15 +1,15 @@
 // netlify/functions/api.mjs
-// ESM version (your package.json has "type":"module")
+// ESM (your package.json has "type":"module")
 import pg from "pg";
 const { Pool } = pg;
 
-// --- DB pool (Neon) ---------------------------------------------------------
+// --- DB (Neon) --------------------------------------------------------------
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // set in Netlify env
-  ssl: { rejectUnauthorized: false },         // Neon requires SSL
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // Neon requires SSL
 });
 
-// --- helpers -----------------------------------------------------------------
+// --- helpers ----------------------------------------------------------------
 const json = (status, body, extraHeaders = {}) => ({
   statusCode: status,
   headers: {
@@ -21,32 +21,27 @@ const json = (status, body, extraHeaders = {}) => ({
   body: JSON.stringify(body),
 });
 
-// Normalise both possible prefixes (/.netlify/functions/api *or* /api)
+// Normalize either "/.netlify/functions/api/..." or "/api/..."
 const normalizePath = (rawPath = "") =>
   rawPath
     .replace(/^\/\.netlify\/functions\/api/, "")
     .replace(/^\/api/, "")
     .replace(/\/+$/, "") || "/";
 
-// Subquery that yields one row per service interaction date per patient.
-// We UNION encounters.created_at::date and treatments.visit_date::date.
-// If one of these tables has no rows, the UNION still works.
-const DATE_EVENTS = `
-  (
-    SELECT patient_id, DATE(created_at) AS d FROM encounters
-    UNION ALL
-    SELECT patient_id, visit_date::date AS d FROM treatments
-  )
+// Reusable SQL snippets (kept simple to avoid template nesting issues)
+const dateEventsSQL = `
+  SELECT patient_id, DATE(created_at) AS d FROM encounters
+  UNION ALL
+  SELECT patient_id, visit_date::date AS d FROM treatments
 `;
 
-// Derived "latest date of service" per patient
-const LAST_DATE_PER_PATIENT = `
+const lastDatePerPatientSQL = `
   SELECT patient_id, MAX(d) AS last_date
-  FROM ${DATE_EVENTS} ev
+  FROM (${dateEventsSQL}) ev
   GROUP BY patient_id
 `;
 
-// --- handler -----------------------------------------------------------------
+// --- handler ----------------------------------------------------------------
 export async function handler(event) {
   const path = normalizePath(event.path);
   const qs = event.queryStringParameters || {};
@@ -60,25 +55,28 @@ export async function handler(event) {
         "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
       },
+      body: "",
     };
   }
 
   try {
-    // ----------------------------------------------------------------- health
-    if (path === "/health") return json(200, { ok: true });
+    // ------------------------------ health
+    if (path === "/health") {
+      return json(200, { ok: true });
+    }
 
-    // Optional DB check (how many patients we see)
+    // Optional DB sanity check
     if (path === "/health/db") {
-      const { rows } = await pool.query("select count(*)::int as n from patients");
+      const { rows } = await pool.query("SELECT COUNT(*)::int AS n FROM patients");
       return json(200, { ok: true, patients: rows[0]?.n ?? 0 });
     }
 
-    // --------------------------------------------------------- billing settings
+    // ------------------------------ billing settings
     if (path === "/billing/settings") {
       const { rows } = await pool.query(
-        `select currency, require_prepayment, consultation_fee
-           from billing_settings
-           limit 1`
+        `SELECT currency, require_prepayment, consultation_fee
+           FROM billing_settings
+           LIMIT 1`
       );
       const row =
         rows[0] || { currency: "USD", require_prepayment: false, consultation_fee: 0 };
@@ -90,23 +88,26 @@ export async function handler(event) {
       });
     }
 
-    // --------------------------------------------------------------- counts API
+    // ------------------------------ patients counts
     if (path === "/patients/counts") {
       const date = qs.date || new Date().toISOString().slice(0, 10);
 
-      // Count distinct patients who had an event on given dates
       const { rows: rToday } = await pool.query(
         `SELECT COUNT(DISTINCT patient_id)::int AS c
-           FROM ${DATE_EVENTS} ev
+           FROM (${dateEventsSQL}) ev
           WHERE ev.d = CURRENT_DATE`
       );
+
       const { rows: rDate } = await pool.query(
         `SELECT COUNT(DISTINCT patient_id)::int AS c
-           FROM ${DATE_EVENTS} ev
+           FROM (${dateEventsSQL}) ev
           WHERE ev.d = $1::date`,
         [date]
       );
-      const { rows: rAll } = await pool.query(`SELECT COUNT(*)::int AS c FROM patients`);
+
+      const { rows: rAll } = await pool.query(
+        `SELECT COUNT(*)::int AS c FROM patients`
+      );
 
       return json(200, {
         today: rToday[0].c,
@@ -115,13 +116,13 @@ export async function handler(event) {
       });
     }
 
-    // ----------------------------------------------------------- patients list
+    // ------------------------------ patients list/search
     if (path === "/patients") {
       const today = qs.today === "true";
-      const date  = qs.date;
+      const date = qs.date;
       const search = qs.search;
 
-      // Base select of patient fields + their last date of service (if any)
+      // Base select: patient fields + last date of service (derived)
       const BASE = `
         SELECT
           p.patient_id          AS "patientId",
@@ -133,35 +134,37 @@ export async function handler(event) {
           ld.last_date          AS "lastEncounterDate",
           p.created_at          AS "createdAt"
         FROM patients p
-        LEFT JOIN (${LAST_DATE_PER_PATIENT}) ld
+        LEFT JOIN (${lastDatePerPatientSQL}) ld
           ON ld.patient_id = p.patient_id
       `;
 
-      let sql, params = [];
+      let sql = "";
+      let params = [];
 
       if (today) {
-        // patients who had an event today
         sql = `
           ${BASE}
           WHERE EXISTS (
-            SELECT 1 FROM ${DATE_EVENTS} ev
-            WHERE ev.patient_id = p.patient_id AND ev.d = CURRENT_DATE
+            SELECT 1
+              FROM (${dateEventsSQL}) ev
+             WHERE ev.patient_id = p.patient_id
+               AND ev.d = CURRENT_DATE
           )
           ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
         `;
       } else if (date) {
-        // patients who had an event on a specific date
         sql = `
           ${BASE}
           WHERE EXISTS (
-            SELECT 1 FROM ${DATE_EVENTS} ev
-            WHERE ev.patient_id = p.patient_id AND ev.d = $1::date
+            SELECT 1
+              FROM (${dateEventsSQL}) ev
+             WHERE ev.patient_id = p.patient_id
+               AND ev.d = $1::date
           )
           ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
         `;
         params = [date];
       } else if (search) {
-        // name/id search
         sql = `
           ${BASE}
           WHERE p.patient_id ILIKE $1
@@ -172,7 +175,6 @@ export async function handler(event) {
         `;
         params = [`%${search}%`];
       } else {
-        // all patients with their latest date (if any)
         sql = `
           ${BASE}
           ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
@@ -182,7 +184,19 @@ export async function handler(event) {
 
       const { rows } = await pool.query(sql, params);
 
-      // Your UI expects a serviceStatus object. Add a minimal one.
+      // UI expects a serviceStatus object
       const out = rows.map((r) => ({
         ...r,
-        serviceStatus: { balance: 0, b
+        serviceStatus: { balance: 0, balanceToday: 0 },
+      }));
+
+      return json(200, out);
+    }
+
+    // ------------------------------ not found
+    return json(404, { error: "Not found" });
+  } catch (err) {
+    console.error("API error:", err);
+    return json(500, { error: "Server error", detail: String(err?.message || err) });
+  }
+}
