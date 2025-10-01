@@ -9,7 +9,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },         // Neon requires SSL
 });
 
-// --- tiny helpers ------------------------------------------------------------
+// --- helpers -----------------------------------------------------------------
 const json = (status, body, extraHeaders = {}) => ({
   statusCode: status,
   headers: {
@@ -27,6 +27,24 @@ const normalizePath = (rawPath = "") =>
     .replace(/^\/\.netlify\/functions\/api/, "")
     .replace(/^\/api/, "")
     .replace(/\/+$/, "") || "/";
+
+// Subquery that yields one row per service interaction date per patient.
+// We UNION encounters.created_at::date and treatments.visit_date::date.
+// If one of these tables has no rows, the UNION still works.
+const DATE_EVENTS = `
+  (
+    SELECT patient_id, DATE(created_at) AS d FROM encounters
+    UNION ALL
+    SELECT patient_id, visit_date::date AS d FROM treatments
+  )
+`;
+
+// Derived "latest date of service" per patient
+const LAST_DATE_PER_PATIENT = `
+  SELECT patient_id, MAX(d) AS last_date
+  FROM ${DATE_EVENTS} ev
+  GROUP BY patient_id
+`;
 
 // --- handler -----------------------------------------------------------------
 export async function handler(event) {
@@ -49,7 +67,7 @@ export async function handler(event) {
     // ----------------------------------------------------------------- health
     if (path === "/health") return json(200, { ok: true });
 
-    // Optional: DB sanity check
+    // Optional DB check (how many patients we see)
     if (path === "/health/db") {
       const { rows } = await pool.query("select count(*)::int as n from patients");
       return json(200, { ok: true, patients: rows[0]?.n ?? 0 });
@@ -65,7 +83,6 @@ export async function handler(event) {
       const row =
         rows[0] || { currency: "USD", require_prepayment: false, consultation_fee: 0 };
 
-      // map to UI field names
       return json(200, {
         currency: row.currency,
         requirePrepayment: row.require_prepayment,
@@ -77,20 +94,19 @@ export async function handler(event) {
     if (path === "/patients/counts") {
       const date = qs.date || new Date().toISOString().slice(0, 10);
 
+      // Count distinct patients who had an event on given dates
       const { rows: rToday } = await pool.query(
-        `select count(*)::int as c
-           from patients
-          where last_encounter_date = current_date`
+        `SELECT COUNT(DISTINCT patient_id)::int AS c
+           FROM ${DATE_EVENTS} ev
+          WHERE ev.d = CURRENT_DATE`
       );
       const { rows: rDate } = await pool.query(
-        `select count(*)::int as c
-           from patients
-          where last_encounter_date = $1::date`,
+        `SELECT COUNT(DISTINCT patient_id)::int AS c
+           FROM ${DATE_EVENTS} ev
+          WHERE ev.d = $1::date`,
         [date]
       );
-      const { rows: rAll } = await pool.query(
-        `select count(*)::int as c from patients`
-      );
+      const { rows: rAll } = await pool.query(`SELECT COUNT(*)::int AS c FROM patients`);
 
       return json(200, {
         today: rToday[0].c,
@@ -102,62 +118,71 @@ export async function handler(event) {
     // ----------------------------------------------------------- patients list
     if (path === "/patients") {
       const today = qs.today === "true";
-      const date = qs.date;
+      const date  = qs.date;
       const search = qs.search;
 
-      const base = `
-        select
-          patient_id           as "patientId",
-          first_name           as "firstName",
-          last_name            as "lastName",
-          age,
-          gender,
-          village,
-          last_encounter_date  as "lastEncounterDate",
-          created_at           as "createdAt"
-        from patients
+      // Base select of patient fields + their last date of service (if any)
+      const BASE = `
+        SELECT
+          p.patient_id          AS "patientId",
+          p.first_name          AS "firstName",
+          p.last_name           AS "lastName",
+          p.age,
+          p.gender,
+          p.village,
+          ld.last_date          AS "lastEncounterDate",
+          p.created_at          AS "createdAt"
+        FROM patients p
+        LEFT JOIN (${LAST_DATE_PER_PATIENT}) ld
+          ON ld.patient_id = p.patient_id
       `;
 
-      let sql, params;
+      let sql, params = [];
+
       if (today) {
-        sql = `${base}
-               where last_encounter_date = current_date
-               order by last_encounter_date desc nulls last, created_at desc`;
-        params = [];
+        // patients who had an event today
+        sql = `
+          ${BASE}
+          WHERE EXISTS (
+            SELECT 1 FROM ${DATE_EVENTS} ev
+            WHERE ev.patient_id = p.patient_id AND ev.d = CURRENT_DATE
+          )
+          ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
+        `;
       } else if (date) {
-        sql = `${base}
-               where last_encounter_date = $1::date
-               order by last_encounter_date desc nulls last, created_at desc`;
+        // patients who had an event on a specific date
+        sql = `
+          ${BASE}
+          WHERE EXISTS (
+            SELECT 1 FROM ${DATE_EVENTS} ev
+            WHERE ev.patient_id = p.patient_id AND ev.d = $1::date
+          )
+          ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
+        `;
         params = [date];
       } else if (search) {
-        sql = `${base}
-               where patient_id ilike $1
-                  or first_name ilike $1
-                  or last_name  ilike $1
-               order by last_encounter_date desc nulls last, created_at desc`;
+        // name/id search
+        sql = `
+          ${BASE}
+          WHERE p.patient_id ILIKE $1
+             OR p.first_name ILIKE $1
+             OR p.last_name  ILIKE $1
+          ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
+          LIMIT 500
+        `;
         params = [`%${search}%`];
       } else {
-        sql = `${base}
-               order by last_encounter_date desc nulls last, created_at desc
-               limit 500`;
-        params = [];
+        // all patients with their latest date (if any)
+        sql = `
+          ${BASE}
+          ORDER BY ld.last_date DESC NULLS LAST, p.created_at DESC
+          LIMIT 500
+        `;
       }
 
       const { rows } = await pool.query(sql, params);
 
-      // Add the minimal status fields your table expects
+      // Your UI expects a serviceStatus object. Add a minimal one.
       const out = rows.map((r) => ({
         ...r,
-        serviceStatus: { balance: 0, balanceToday: 0 },
-      }));
-
-      return json(200, out);
-    }
-
-    // -------------------------------------------------------------- not found
-    return json(404, { error: "Not found" });
-  } catch (err) {
-    console.error("API error:", err);
-    return json(500, { error: "Server error", detail: String(err?.message || err) });
-  }
-}
+        serviceStatus: { balance: 0, b
