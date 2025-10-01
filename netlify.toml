@@ -1,18 +1,17 @@
 [build]
   command   = "npm run build"
-  publish   = "dist/public"         # keep your current publish folder
+  publish   = "dist/public"         # keep your current Vite output
   functions = "netlify/functions"   # <— add this
 
-# 1) Send all /api/* requests to the serverless function
+# Route all /api/* requests to the serverless function
 [[redirects]]
   from = "/api/*"
   to   = "/.netlify/functions/api/:splat"
   status = 200
   force  = true
 
-# 2) SPA fallback (must be AFTER the /api/* rule)
+# SPA fallback (must be after /api/* rule)
 [[redirects]]
   from = "/*"
   to   = "/index.html"
   status = 200
-
