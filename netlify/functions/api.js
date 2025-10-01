@@ -15,7 +15,6 @@ function json(status, body) {
 }
 
 exports.handler = async (event) => {
-  // path like "/patients", "/patients/counts", "/billing/settings"
   const path = event.path.replace("/.netlify/functions/api", "");
   const qs = event.queryStringParameters || {};
 
