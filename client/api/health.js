@@ -1,4 +1,4 @@
-// Simple sanity check: GET /api/health -> { ok: true }
+// client/api/health.js
 export default function handler(req, res) {
   res.status(200).json({ ok: true });
 }
